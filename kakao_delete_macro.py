@@ -3,46 +3,65 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any
 
 import keyboard
 import pyautogui
-from PIL import Image, ImageChops, ImageStat
+
+try:
+    from PIL import Image, ImageChops, ImageStat
+    PIL_IMPORT_ERROR: Exception | None = None
+except Exception as exc:  # pragma: no cover - import guard for runtime
+    Image = Any  # type: ignore[misc,assignment]
+    ImageChops = None  # type: ignore[assignment]
+    ImageStat = None  # type: ignore[assignment]
+    PIL_IMPORT_ERROR = exc
 
 
 CAPTURE_KEYS = {"space", "enter"}
 
-# ====== 사용자 설정 상수 ======
-SCROLL_AMOUNT = 24  # 양수=위로 스크롤, 음수=아래로 스크롤
+# ----- Tuning -----
+SCROLL_AMOUNT = 20
 
 MOVE_DURATION_SEC = 0.03
-MENU_WAIT_SEC = 0.08
-DELETE_HOVER_WAIT_SEC = 0.34
-SUBMENU_STABILIZE_WAIT_SEC = 0.06
-AFTER_DELETE_CLICK_WAIT_SEC = 0.20
+MENU_WAIT_SEC = 0.10
+DELETE_HOVER_WAIT_SEC = 0.40
+DELETE_HOVER_WAIT_FALLBACK_SEC = 0.55
+SUBMENU_STABILIZE_WAIT_SEC = 0.07
+AFTER_DELETE_CLICK_WAIT_SEC = 0.22
 
-# "삭제 hover" 기준으로 "모두에게서 삭제" 클릭 오프셋
-SUBMENU_X_OFFSET_PX = 112
-SUBMENU_Y_OFFSET_PX = 2
+# submenu click candidate offsets from "delete hover" point
+SUBMENU_OFFSETS: list[tuple[int, int]] = [
+    (112, 2),
+    (112, 6),
+    (112, -2),
+    (106, 2),
+    (118, 2),
+]
 
-# 메시지 유형별 메뉴 차이를 흡수하는 자동 탐색 오프셋(픽셀)
-# 일반/답장/이미지 차이를 세로 방향으로 순차 탐색
-DELETE_HOVER_Y_OFFSETS = [0, -28, 28, -56, 56, -84, 84, -112, 112]
-RETRIES_PER_OFFSET = 2
+# message-type variation candidates (general/reply/image) by Y offset
+HOVER_Y_OFFSETS = [0, -24, 24, -48, 48, -72, 72, -96, 96, -120, 120]
+
+RETRIES_PER_COMBO = 1
+MAX_ATTEMPTS_PER_CYCLE = 18
 RETRY_GAP_SEC = 0.08
 
-# 채팅창 포커스 복귀 클릭 오프셋
 FOCUS_LEFT_OFFSET_PX = 40
 FOCUS_Y_OFFSET_PX = 0
 FOCUS_CLICK_WAIT_SEC = 0.06
 INTERVAL_SEC = 0.22
 
-# 삭제 성공 판정(화면 변화량 기반)
-PROBE_BOX_WIDTH = 220
-PROBE_BOX_HEIGHT = 140
-DELETE_CHANGE_THRESHOLD = 5.0
-DELETE_DETECT_TIMEOUT_SEC = 0.90
+# deletion detection (region difference based)
+PROBE_BOX_WIDTH = 240
+PROBE_BOX_HEIGHT = 160
+PROBE_CENTER_X_OFFSET = -90
+PROBE_CENTER_Y_OFFSET = 0
+
+DELETE_CHANGE_THRESHOLD = 5.5
+DELETE_DETECT_TIMEOUT_SEC = 1.00
 DELETE_DETECT_INTERVAL_SEC = 0.10
+DELETE_PERSISTENCE_CHECK_SEC = 0.12
+DELETE_CONFIRM_RATIO = 0.65
 
 PAUSE_ON_DELETE_FAIL = True
 
@@ -62,11 +81,22 @@ class MacroConfig:
     delete_hover_base: Point
 
 
+@dataclass
+class AdaptiveState:
+    hover_idx: int = 0
+    submenu_idx: int = 0
+    wait_idx: int = 0
+
+
 def clamp(value: int, min_value: int, max_value: int) -> int:
     return max(min_value, min(max_value, value))
 
 
-def wait_capture_action(allow_skip: bool = False) -> str:
+def hotkey_to_label(key: str) -> str:
+    return key.upper() if len(key) <= 3 else key
+
+
+def wait_capture_key() -> None:
     while True:
         event = keyboard.read_event(suppress=False)
         if event.event_type != keyboard.KEY_DOWN:
@@ -74,40 +104,29 @@ def wait_capture_action(allow_skip: bool = False) -> str:
 
         key = (event.name or "").lower()
         if key in CAPTURE_KEYS:
-            return "capture"
-        if allow_skip and key == "s":
-            return "skip"
+            return
         if key == QUIT_KEY:
             raise KeyboardInterrupt
 
 
-def capture_point(
-    title: str,
-    allow_skip: bool = False,
-    skip_point: Optional[Point] = None,
-) -> Point:
+def capture_point(title: str) -> Point:
     print(f"\n{title}")
-    if allow_skip:
-        print("[Space/Enter]=캡처 / [S]=이전 좌표 재사용 / [Esc]=취소")
-    else:
-        print("[Space/Enter]=캡처 / [Esc]=취소")
-
-    action = wait_capture_action(allow_skip=allow_skip)
-    if action == "skip":
-        if skip_point is None:
-            raise RuntimeError("재사용할 이전 좌표가 없습니다.")
-        print(f"이전 좌표 사용: ({skip_point.x}, {skip_point.y})")
-        return skip_point
+    print(f"[Space/Enter]=capture / [{hotkey_to_label(QUIT_KEY)}]=cancel")
+    wait_capture_key()
 
     x, y = pyautogui.position()
-    print(f"좌표 저장: ({x}, {y})")
+    print(f"captured: ({x}, {y})")
     time.sleep(0.2)
     return Point(x=x, y=y)
 
 
+def move_and_click(point: Point, button: str = "left") -> None:
+    pyautogui.moveTo(point.x, point.y, duration=MOVE_DURATION_SEC)
+    pyautogui.click(button=button)
+
+
 def open_context_menu(target: Point) -> None:
-    pyautogui.moveTo(target.x, target.y, duration=MOVE_DURATION_SEC)
-    pyautogui.click(button="right")
+    move_and_click(target, button="right")
     time.sleep(MENU_WAIT_SEC)
 
 
@@ -119,37 +138,42 @@ def focus_point_from_target(target: Point) -> Point:
 
 
 def focus_chat_area(target: Point) -> None:
-    p = focus_point_from_target(target)
-    pyautogui.moveTo(p.x, p.y, duration=MOVE_DURATION_SEC)
-    pyautogui.click(button="left")
+    move_and_click(focus_point_from_target(target), button="left")
     time.sleep(FOCUS_CLICK_WAIT_SEC)
 
 
-def submenu_click_point_from_hover(hover: Point) -> Point:
+def hover_point(base: Point, y_offset: int) -> Point:
     screen_w, screen_h = pyautogui.size()
-    x = clamp(hover.x + SUBMENU_X_OFFSET_PX, 0, screen_w - 1)
-    y = clamp(hover.y + SUBMENU_Y_OFFSET_PX, 0, screen_h - 1)
-    return Point(x=x, y=y)
+    return Point(
+        x=clamp(base.x, 0, screen_w - 1),
+        y=clamp(base.y + y_offset, 0, screen_h - 1),
+    )
 
 
-def hover_with_y_offset(base: Point, y_offset: int) -> Point:
+def submenu_click_point(hover: Point, submenu_offset: tuple[int, int]) -> Point:
     screen_w, screen_h = pyautogui.size()
-    x = clamp(base.x, 0, screen_w - 1)
-    y = clamp(base.y + y_offset, 0, screen_h - 1)
-    return Point(x=x, y=y)
+    x_off, y_off = submenu_offset
+    return Point(
+        x=clamp(hover.x + x_off, 0, screen_w - 1),
+        y=clamp(hover.y + y_off, 0, screen_h - 1),
+    )
 
 
-def probe_region_from_target(target: Point) -> tuple[int, int, int, int]:
+def probe_region(target: Point) -> tuple[int, int, int, int]:
     screen_w, screen_h = pyautogui.size()
     width = min(PROBE_BOX_WIDTH, screen_w)
     height = min(PROBE_BOX_HEIGHT, screen_h)
-    left = clamp(target.x - (width // 2), 0, screen_w - width)
-    top = clamp(target.y - (height // 2), 0, screen_h - height)
+
+    center_x = clamp(target.x + PROBE_CENTER_X_OFFSET, 0, screen_w - 1)
+    center_y = clamp(target.y + PROBE_CENTER_Y_OFFSET, 0, screen_h - 1)
+
+    left = clamp(center_x - (width // 2), 0, screen_w - width)
+    top = clamp(center_y - (height // 2), 0, screen_h - height)
     return left, top, width, height
 
 
 def capture_probe_gray(target: Point) -> Image.Image:
-    left, top, width, height = probe_region_from_target(target)
+    left, top, width, height = probe_region(target)
     return pyautogui.screenshot(region=(left, top, width, height)).convert("L")
 
 
@@ -167,100 +191,146 @@ def detect_deleted(before_probe: Image.Image, target: Point) -> tuple[bool, floa
         after_probe = capture_probe_gray(target)
         score = change_score(before_probe, after_probe)
         best_score = max(best_score, score)
+
         if score >= DELETE_CHANGE_THRESHOLD:
-            return True, best_score
+            time.sleep(DELETE_PERSISTENCE_CHECK_SEC)
+            confirm_probe = capture_probe_gray(target)
+            confirm_score = change_score(before_probe, confirm_probe)
+            best_score = max(best_score, confirm_score)
+            if confirm_score >= DELETE_CHANGE_THRESHOLD * DELETE_CONFIRM_RATIO:
+                return True, best_score
+
         if time.time() >= deadline:
             return False, best_score
         time.sleep(DELETE_DETECT_INTERVAL_SEC)
 
 
-def try_delete_with_hover(target: Point, hover: Point) -> None:
+def build_order(total: int, preferred_idx: int) -> list[int]:
+    if total <= 0:
+        return []
+    preferred = clamp(preferred_idx, 0, total - 1)
+    return sorted(range(total), key=lambda i: (0 if i == preferred else 1, abs(i - preferred), i))
+
+
+def try_delete_once(
+    target: Point,
+    base_hover: Point,
+    hover_y_offset: int,
+    submenu_offset: tuple[int, int],
+    hover_wait: float,
+) -> None:
     open_context_menu(target)
 
+    hover = hover_point(base_hover, hover_y_offset)
     pyautogui.moveTo(hover.x, hover.y, duration=MOVE_DURATION_SEC)
-    time.sleep(DELETE_HOVER_WAIT_SEC)
+    time.sleep(hover_wait)
 
-    submenu_click = submenu_click_point_from_hover(hover)
-    pyautogui.moveTo(submenu_click.x, submenu_click.y, duration=MOVE_DURATION_SEC)
+    submenu = submenu_click_point(hover, submenu_offset)
+    pyautogui.moveTo(submenu.x, submenu.y, duration=MOVE_DURATION_SEC)
     time.sleep(SUBMENU_STABILIZE_WAIT_SEC)
     pyautogui.click(button="left")
     time.sleep(AFTER_DELETE_CLICK_WAIT_SEC)
 
+    # close residual context UI and return wheel focus to chat area
+    focus_chat_area(target)
+
+
+def run_cycle(config: MacroConfig, adaptive: AdaptiveState) -> tuple[bool, str]:
+    wait_candidates = [DELETE_HOVER_WAIT_SEC, DELETE_HOVER_WAIT_FALLBACK_SEC]
+
+    hover_order = build_order(len(HOVER_Y_OFFSETS), adaptive.hover_idx)
+    submenu_order = build_order(len(SUBMENU_OFFSETS), adaptive.submenu_idx)
+    wait_order = build_order(len(wait_candidates), adaptive.wait_idx)
+
+    logs: list[str] = []
+    attempts = 0
+
+    for w_idx in wait_order:
+        hover_wait = wait_candidates[w_idx]
+
+        for h_idx in hover_order:
+            y_offset = HOVER_Y_OFFSETS[h_idx]
+
+            for s_idx in submenu_order:
+                submenu_offset = SUBMENU_OFFSETS[s_idx]
+
+                for retry in range(1, RETRIES_PER_COMBO + 1):
+                    attempts += 1
+                    before_probe = capture_probe_gray(config.target)
+
+                    try:
+                        try_delete_once(
+                            target=config.target,
+                            base_hover=config.delete_hover_base,
+                            hover_y_offset=y_offset,
+                            submenu_offset=submenu_offset,
+                            hover_wait=hover_wait,
+                        )
+                        success, score = detect_deleted(before_probe, config.target)
+                        logs.append(
+                            "w="
+                            f"{hover_wait:.2f},y={y_offset},s={submenu_offset},r={retry},score={score:.2f}"
+                        )
+                    except Exception as exc:
+                        logs.append(
+                            "w="
+                            f"{hover_wait:.2f},y={y_offset},s={submenu_offset},r={retry},err={exc}"
+                        )
+                        success = False
+                        try:
+                            focus_chat_area(config.target)
+                        except Exception:
+                            pass
+
+                    if success:
+                        adaptive.wait_idx = w_idx
+                        adaptive.hover_idx = h_idx
+                        adaptive.submenu_idx = s_idx
+                        return True, "; ".join(logs)
+
+                    if attempts >= MAX_ATTEMPTS_PER_CYCLE:
+                        return False, "; ".join(logs)
+
+                    time.sleep(RETRY_GAP_SEC)
+
+    return False, "; ".join(logs)
+
 
 def calibrate_every_run() -> MacroConfig:
-    print("\n=== 좌표 입력 (매번 실행 시 재입력) ===")
-    print("카카오톡 채팅창을 열어두세요.")
-    print("이번 버전은 '삭제 hover' 좌표 1개만 입력하면 자동 오프셋 탐색합니다.")
+    print("\n=== Coordinate Setup (every run) ===")
+    print("Keep KakaoTalk chat window open and fixed.")
+    print("This version needs only 2 points.")
 
-    target = capture_point("1/2 내 말풍선 오른쪽 아래 안전한 우클릭 지점")
+    target = capture_point("1/2: right-click safe point near your own bubble")
 
-    print("\n우클릭 메뉴를 자동으로 띄웁니다.")
+    print("\nOpen menu once automatically to capture delete-hover base point...")
     time.sleep(0.2)
     open_context_menu(target)
 
-    delete_hover_base = capture_point(
-        "2/2 '삭제' hover 기준 좌표 (아무 유형 1개만 잡아도 됨)"
-    )
-
+    delete_hover_base = capture_point("2/2: hover point on 'Delete' menu item")
     return MacroConfig(target=target, delete_hover_base=delete_hover_base)
-
-
-def offset_order(preferred_idx: int) -> list[int]:
-    total = len(DELETE_HOVER_Y_OFFSETS)
-    preferred = clamp(preferred_idx, 0, total - 1)
-    order = [preferred]
-    for i in range(total):
-        if i != preferred:
-            order.append(i)
-    return order
-
-
-def run_cycle(config: MacroConfig, preferred_offset_idx: int) -> tuple[bool, int, str]:
-    logs: list[str] = []
-
-    for idx in offset_order(preferred_offset_idx):
-        y_offset = DELETE_HOVER_Y_OFFSETS[idx]
-        hover = hover_with_y_offset(config.delete_hover_base, y_offset)
-
-        for retry in range(1, RETRIES_PER_OFFSET + 1):
-            before_probe = capture_probe_gray(config.target)
-            try_delete_with_hover(config.target, hover)
-            focus_chat_area(config.target)
-            success, score = detect_deleted(before_probe, config.target)
-            logs.append(f"o{y_offset}/r{retry}:{score:.2f}")
-            if success:
-                return True, idx, ", ".join(logs)
-            time.sleep(RETRY_GAP_SEC)
-
-    return False, preferred_offset_idx, ", ".join(logs)
-
-
-def post_delete_scroll() -> None:
-    pyautogui.scroll(SCROLL_AMOUNT)
-    time.sleep(INTERVAL_SEC)
 
 
 def run_macro(config: MacroConfig) -> None:
     state = {"running": False, "quit": False}
+    adaptive = AdaptiveState()
     cycle_count = 0
-    preferred_offset_idx = 0
 
     def toggle_running() -> None:
         state["running"] = not state["running"]
-        print("\n실행 시작" if state["running"] else "\n일시정지")
+        print("\nRUN" if state["running"] else "\nPAUSE")
 
-    def stop_macro() -> None:
+    def request_quit() -> None:
         state["quit"] = True
         state["running"] = False
-        print("\n종료 요청됨")
+        print("\nSTOP requested")
 
     keyboard.add_hotkey(START_PAUSE_KEY, toggle_running)
-    keyboard.add_hotkey(QUIT_KEY, stop_macro)
+    keyboard.add_hotkey(QUIT_KEY, request_quit)
 
-    print("\n=== 매크로 준비 완료 ===")
-    print(f"[{START_PAUSE_KEY.upper()}] 시작/일시정지 | [{QUIT_KEY.upper()}] 종료")
-    print("비상정지: 마우스를 화면 좌상단으로 이동 (PyAutoGUI fail-safe)")
-    print("카카오톡 창에 포커스를 두고 시작하세요.")
+    print("\n=== Macro Ready ===")
+    print(f"[{hotkey_to_label(START_PAUSE_KEY)}]=start/pause, [{hotkey_to_label(QUIT_KEY)}]=quit")
+    print("Emergency stop: move mouse to top-left corner.")
 
     try:
         while not state["quit"]:
@@ -269,34 +339,37 @@ def run_macro(config: MacroConfig) -> None:
                 continue
 
             try:
-                deleted, used_offset_idx, debug_log = run_cycle(
-                    config=config,
-                    preferred_offset_idx=preferred_offset_idx,
-                )
+                deleted, debug_log = run_cycle(config, adaptive)
                 if not deleted:
-                    print(f"\n삭제 실패 추정. 시도 로그: {debug_log}")
+                    print("\nDelete not confirmed.")
+                    print(f"Debug: {debug_log[-450:]}")
                     if PAUSE_ON_DELETE_FAIL:
-                        print("자동 일시정지됨. 상단 상수 조정 후 F8로 재시작하세요.")
+                        print("Paused automatically. Adjust constants and press F8.")
                         state["running"] = False
                         continue
-                else:
-                    preferred_offset_idx = used_offset_idx
 
-                post_delete_scroll()
+                pyautogui.scroll(SCROLL_AMOUNT)
+                time.sleep(INTERVAL_SEC)
+
                 cycle_count += 1
-                print(f"\r반복 횟수: {cycle_count}", end="", flush=True)
+                print(f"\rcycles: {cycle_count}", end="", flush=True)
             except pyautogui.FailSafeException:
-                print("\n비상정지 감지됨. 일시정지합니다.")
+                print("\nFail-safe triggered. Paused.")
                 state["running"] = False
             except Exception as exc:
-                print(f"\n반복 중 오류: {exc}")
+                print(f"\nCycle error: {exc}")
                 state["running"] = False
     finally:
         keyboard.clear_all_hotkeys()
-        print("\n매크로 종료")
+        print("\nMacro ended.")
 
 
 def main() -> int:
+    if PIL_IMPORT_ERROR is not None:
+        print("Pillow import failed. Run: pip install -r requirements.txt")
+        print(f"detail: {PIL_IMPORT_ERROR}")
+        return 1
+
     pyautogui.FAILSAFE = True
     pyautogui.PAUSE = 0.0
 
@@ -305,10 +378,10 @@ def main() -> int:
         run_macro(config)
         return 0
     except KeyboardInterrupt:
-        print("\n사용자 취소")
+        print("\nCanceled by user.")
         return 1
     except Exception as exc:
-        print(f"\n치명적 오류: {exc}")
+        print(f"\nFatal error: {exc}")
         return 1
 
 
